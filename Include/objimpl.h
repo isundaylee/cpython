@@ -254,13 +254,22 @@ typedef union _gc_head {
         union _gc_head *gc_next;
         union _gc_head *gc_prev;
         Py_ssize_t gc_refs;
+        PyObject *gc_ob;
     } gc;
     double dummy;  /* force worst-case alignment */
 } PyGC_Head;
 
+typedef union _gc_head_ptr {
+    struct {
+        union _gc_head *head;
+    } gc_ptr;
+    double dummy; /* force worst-case alignment */
+} PyGC_Head_Ptr;
+
 extern PyGC_Head *_PyGC_generation0;
 
-#define _Py_AS_GC(o) ((PyGC_Head *)(o)-1)
+#define _Py_AS_GC_PTR(o) ((PyGC_Head_Ptr *)(o)-1)
+#define _Py_AS_GC(o) (_Py_AS_GC_PTR(o)->gc_ptr.head)
 
 /* Bit 0 is set when tp_finalize is called */
 #define _PyGC_REFS_MASK_FINALIZED  (1 << 0)

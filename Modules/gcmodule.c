@@ -29,10 +29,12 @@
 #include "pytime.h"             /* for _PyTime_GetMonotonicClock() */
 
 /* Get an object's GC head */
-#define AS_GC(o) ((PyGC_Head *)(o)-1)
+#define AS_GC_PTR(o) ((PyGC_Head_Ptr *)(o)-1)
+#define AS_GC(o) (AS_GC_PTR(o)->gc_ptr.head)
 
 /* Get the object given the GC head */
-#define FROM_GC(g) ((PyObject *)(((PyGC_Head *)g)+1))
+#define FROM_GC_PTR(g) ((PyObject *)(((PyGC_Head_Ptr *)g)+1))
+#define FROM_GC(g) ((g)->gc.gc_ob)
 
 /*** Global GC state ***/
 
@@ -45,6 +47,54 @@ struct gc_generation {
 
 #define NUM_GENERATIONS 3
 #define GEN_HEAD(n) (&generations[n].head)
+
+/* Free list for the allocations of GC heads */
+
+/* The size of memory block that GC will allocate each time to be used for GC
+ * heads */
+static const
+size_t gc_head_pool_size = 256 * (1 << 10); // 256 KB
+
+PyGC_Head *gc_head_current_pool = NULL;
+size_t gc_head_free_blocks_in_pool = 0;
+
+/* A free block usable as a GC head */
+struct gc_head_free_block {
+    struct gc_head_free_block *next;
+};
+
+/* The list of GC head free blocks */
+struct gc_head_free_block gc_head_free_list;
+
+static PyGC_Head*
+gc_head_alloc(void) {
+    /* 1) check the free list */
+    if (gc_head_free_list.next != NULL) {
+        PyGC_Head *allocated = (PyGC_Head *)gc_head_free_list.next;
+        gc_head_free_list.next = gc_head_free_list.next->next;
+        return allocated;
+    }
+
+    /* 2) check if we need to allocate a new pool */
+    if (gc_head_free_blocks_in_pool == 0) {
+        gc_head_current_pool = (PyGC_Head*)malloc(gc_head_pool_size);
+        gc_head_free_blocks_in_pool = gc_head_pool_size / sizeof(PyGC_Head);
+    }
+
+    /* 3) allocate from the current pool */
+    PyGC_Head *allocated = gc_head_current_pool;
+    gc_head_current_pool++;
+    gc_head_free_blocks_in_pool--;
+    return allocated;
+}
+
+static void
+gc_head_free(PyGC_Head *block) {
+    /* Return the block to the free list */
+    struct gc_head_free_block *free_block = (struct gc_head_free_block *)block;
+    free_block->next = gc_head_free_list.next;
+    gc_head_free_list.next = free_block;
+}
 
 /* linked lists of container objects */
 static struct gc_generation generations[NUM_GENERATIONS] = {
@@ -1703,19 +1753,22 @@ static PyObject *
 _PyObject_GC_Alloc(int use_calloc, size_t basicsize)
 {
     PyObject *op;
-    PyGC_Head *g;
+    PyGC_Head_Ptr *g_ptr;
     size_t size;
-    if (basicsize > PY_SSIZE_T_MAX - sizeof(PyGC_Head))
+    if (basicsize > PY_SSIZE_T_MAX - sizeof(PyGC_Head_Ptr))
         return PyErr_NoMemory();
-    size = sizeof(PyGC_Head) + basicsize;
+    size = sizeof(PyGC_Head_Ptr) + basicsize;
     if (use_calloc)
-        g = (PyGC_Head *)PyObject_Calloc(1, size);
+        g_ptr = (PyGC_Head_Ptr *)PyObject_Calloc(1, size);
     else
-        g = (PyGC_Head *)PyObject_Malloc(size);
-    if (g == NULL)
+        g_ptr = (PyGC_Head_Ptr *)PyObject_Malloc(size);
+    if (g_ptr == NULL)
         return PyErr_NoMemory();
-    g->gc.gc_refs = 0;
-    _PyGCHead_SET_REFS(g, GC_UNTRACKED);
+    g_ptr->gc_ptr.head = gc_head_alloc();
+    g_ptr->gc_ptr.head->gc.gc_refs = 0;
+    op = FROM_GC_PTR(g_ptr);
+    g_ptr->gc_ptr.head->gc.gc_ob = op;
+    _PyGCHead_SET_REFS(g_ptr->gc_ptr.head, GC_UNTRACKED);
     generations[0].count++; /* number of allocated GC objects */
     if (generations[0].count > generations[0].threshold &&
         enabled &&
@@ -1726,7 +1779,6 @@ _PyObject_GC_Alloc(int use_calloc, size_t basicsize)
         collect_generations();
         collecting = 0;
     }
-    op = FROM_GC(g);
     return op;
 }
 
@@ -1772,13 +1824,14 @@ PyVarObject *
 _PyObject_GC_Resize(PyVarObject *op, Py_ssize_t nitems)
 {
     const size_t basicsize = _PyObject_VAR_SIZE(Py_TYPE(op), nitems);
-    PyGC_Head *g = AS_GC(op);
-    if (basicsize > PY_SSIZE_T_MAX - sizeof(PyGC_Head))
+    PyGC_Head_Ptr *g_ptr = AS_GC_PTR(op);
+    if (basicsize > PY_SSIZE_T_MAX - sizeof(PyGC_Head_Ptr))
         return (PyVarObject *)PyErr_NoMemory();
-    g = (PyGC_Head *)PyObject_REALLOC(g,  sizeof(PyGC_Head) + basicsize);
-    if (g == NULL)
+    g_ptr = (PyGC_Head_Ptr *)PyObject_REALLOC(g_ptr,  sizeof(PyGC_Head_Ptr) + basicsize);
+    if (g_ptr == NULL)
         return (PyVarObject *)PyErr_NoMemory();
-    op = (PyVarObject *) FROM_GC(g);
+    op = (PyVarObject *) FROM_GC_PTR(g_ptr);
+    g_ptr->gc_ptr.head->gc.gc_ob = (PyObject*) op;
     Py_SIZE(op) = nitems;
     return op;
 }
@@ -1786,11 +1839,13 @@ _PyObject_GC_Resize(PyVarObject *op, Py_ssize_t nitems)
 void
 PyObject_GC_Del(void *op)
 {
+    PyGC_Head_Ptr *g_ptr = AS_GC_PTR(op);
     PyGC_Head *g = AS_GC(op);
     if (IS_TRACKED(op))
         gc_list_remove(g);
     if (generations[0].count > 0) {
         generations[0].count--;
     }
-    PyObject_FREE(g);
+    PyObject_FREE(g_ptr);
+    gc_head_free(g);
 }
