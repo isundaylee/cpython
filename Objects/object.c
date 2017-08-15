@@ -1958,7 +1958,7 @@ _PyTrash_deposit_object(PyObject *op)
     assert(PyObject_IS_GC(op));
     assert(_PyGC_REFS(op) == _PyGC_REFS_UNTRACKED);
     assert(op->ob_refcnt == 0);
-    _Py_AS_GC(op)->gc.gc_prev = (PyGC_Head *)_PyTrash_delete_later;
+    _Py_AS_GC_PTR(op)->gc_ptr.head = (PyGC_Head*)_PyTrash_delete_later;
     _PyTrash_delete_later = op;
 }
 
@@ -1970,7 +1970,7 @@ _PyTrash_thread_deposit_object(PyObject *op)
     assert(PyObject_IS_GC(op));
     assert(_PyGC_REFS(op) == _PyGC_REFS_UNTRACKED);
     assert(op->ob_refcnt == 0);
-    _Py_AS_GC(op)->gc.gc_prev = (PyGC_Head *) tstate->trash_delete_later;
+    _Py_AS_GC_PTR(op)->gc_ptr.head = (PyGC_Head*) tstate->trash_delete_later;
     tstate->trash_delete_later = op;
 }
 
@@ -1985,7 +1985,7 @@ _PyTrash_destroy_chain(void)
         destructor dealloc = Py_TYPE(op)->tp_dealloc;
 
         _PyTrash_delete_later =
-            (PyObject*) _Py_AS_GC(op)->gc.gc_prev;
+            (PyObject*) _Py_AS_GC_PTR(op)->gc_ptr.head;
 
         /* Call the deallocator directly.  This used to try to
          * fool Py_DECREF into calling it indirectly, but
@@ -2010,7 +2010,7 @@ _PyTrash_thread_destroy_chain(void)
         destructor dealloc = Py_TYPE(op)->tp_dealloc;
 
         tstate->trash_delete_later =
-            (PyObject*) _Py_AS_GC(op)->gc.gc_prev;
+            (PyObject*) _Py_AS_GC_PTR(op)->gc_ptr.head;
 
         /* Call the deallocator directly.  This used to try to
          * fool Py_DECREF into calling it indirectly, but
